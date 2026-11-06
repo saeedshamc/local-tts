@@ -1,0 +1,27 @@
+
+voice_log.json
+voice_log.json.bak
+voice_log.json.tmp
+voice_settings.json
+reply.wav
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+
+*.onnx
+*.onnx.json
+*.bin
+*.safetensors
+*.pt
+*.gguf
+models/
+
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
