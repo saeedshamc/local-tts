@@ -1,11 +1,15 @@
 """Voice Assistant (GUI): record -> Whisper (Persian STT) -> Piper (Persian TTS).
 
-Every step is logged to voice_log.json next to this script.
+- Models are listed from the folders you choose.
+- STT and TTS can each be turned ON/OFF and run on CPU or GPU (CUDA).
+- Every step is logged to voice_log.json next to this script.
 """
+import glob
 import gc
 import json
 import os
 import queue
+import site
 import threading
 import time
 import tkinter as tk
@@ -15,10 +19,28 @@ from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
-import numpy as np
-import sounddevice as sd
-from faster_whisper import WhisperModel
-from piper import PiperVoice
+
+def _add_nvidia_dll_dirs():
+    """Make CUDA DLLs installed via pip (nvidia-cublas-cu12, nvidia-cudnn-cu12) visible."""
+    try:
+        bases = site.getsitepackages()
+    except Exception:
+        return
+    for base in bases:
+        for d in glob.glob(os.path.join(base, "nvidia", "*", "bin")):
+            try:
+                os.add_dll_directory(d)
+            except OSError:
+                pass
+            os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+
+
+_add_nvidia_dll_dirs()
+
+import numpy as np  # noqa: E402
+import sounddevice as sd  # noqa: E402
+from faster_whisper import WhisperModel  # noqa: E402
+from piper import PiperVoice  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(HERE, "voice_log.json")
@@ -26,9 +48,13 @@ SETTINGS_FILE = os.path.join(HERE, "voice_settings.json")
 REPLY_WAV = os.path.join(HERE, "reply.wav")
 SAMPLE_RATE = 16000
 
+DEVICES = ["CPU", "GPU (CUDA)"]
+
 DEFAULT_SETTINGS = {
     "stt_dir": r"D:\Saeed\STT-Models",
     "tts_dir": r"D:\Saeed\TTS-Models",
+    "stt_device": "CPU",
+    "tts_device": "CPU",
     "seconds": 5,
     "echo": True,
 }
@@ -126,8 +152,8 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("Persian Voice Assistant")
-        root.geometry("820x640")
-        root.minsize(720, 560)
+        root.geometry("820x680")
+        root.minsize(720, 600)
 
         self.settings = self._load_settings()
         self.steplog = StepLog(LOG_FILE)
@@ -158,6 +184,8 @@ class App:
         self.settings.update(
             stt_dir=self.stt_dir_var.get(),
             tts_dir=self.tts_dir_var.get(),
+            stt_device=self.stt_box["device"].get(),
+            tts_device=self.tts_box["device"].get(),
             seconds=self.seconds_var.get(),
             echo=self.echo_var.get(),
         )
@@ -174,27 +202,31 @@ class App:
         main.pack(fill="both", expand=True)
         main.columnconfigure(0, weight=1)
 
+        # --- recording variables first (used by _save_settings)
+        self.seconds_var = tk.IntVar(value=int(self.settings["seconds"]))
+        self.echo_var = tk.BooleanVar(value=bool(self.settings["echo"]))
+
         # --- STT box
         self.stt_dir_var = tk.StringVar(value=self.settings["stt_dir"])
         self.stt_box = self._model_box(
             main, 0, "STT (Whisper) - speech to text",
-            self.stt_dir_var, self.browse_stt, self.toggle_stt)
+            self.stt_dir_var, self.browse_stt, self.toggle_stt,
+            self.settings["stt_device"])
 
         # --- TTS box
         self.tts_dir_var = tk.StringVar(value=self.settings["tts_dir"])
         self.tts_box = self._model_box(
             main, 1, "TTS (Piper) - text to speech",
-            self.tts_dir_var, self.browse_tts, self.toggle_tts)
+            self.tts_dir_var, self.browse_tts, self.toggle_tts,
+            self.settings["tts_device"])
 
         # --- recording box
         rec = ttk.LabelFrame(main, text="Recording")
         rec.grid(row=2, column=0, sticky="ew", **pad)
         rec.columnconfigure(3, weight=1)
         ttk.Label(rec, text="Record time (seconds):").grid(row=0, column=0, **pad)
-        self.seconds_var = tk.IntVar(value=int(self.settings["seconds"]))
         ttk.Spinbox(rec, from_=1, to=120, width=6,
                     textvariable=self.seconds_var).grid(row=0, column=1, **pad)
-        self.echo_var = tk.BooleanVar(value=bool(self.settings["echo"]))
         ttk.Checkbutton(rec, text="Speak the heard text back",
                         variable=self.echo_var).grid(row=0, column=2, **pad)
         self.rec_btn = ttk.Button(rec, text="🎙  Record", command=self.start_record)
@@ -233,7 +265,8 @@ class App:
         self.log_box.tag_config("ok", foreground="#1e8449")
         self.log_box.tag_config("warn", foreground="#b9770e")
 
-    def _model_box(self, parent, row, title, dir_var, browse_cmd, toggle_cmd):
+    def _model_box(self, parent, row, title, dir_var, browse_cmd, toggle_cmd,
+                   device_default):
         pad = {"padx": 8, "pady": 4}
         box = ttk.LabelFrame(parent, text=title)
         box.grid(row=row, column=0, sticky="ew", **pad)
@@ -251,7 +284,12 @@ class App:
         btn.grid(row=1, column=2, **pad)
         status = tk.Label(box, text="● OFF", fg="#c0392b", width=14, anchor="w")
         status.grid(row=1, column=3, **pad)
-        return {"combo": combo, "btn": btn, "status": status}
+
+        ttk.Label(box, text="Device:").grid(row=2, column=0, **pad)
+        device = ttk.Combobox(box, state="readonly", width=16, values=DEVICES)
+        device.set(device_default if device_default in DEVICES else DEVICES[0])
+        device.grid(row=2, column=1, sticky="w", **pad)
+        return {"combo": combo, "btn": btn, "status": status, "device": device}
 
     # ---------------- thread -> UI helpers ----------------
     def ui(self, fn, *args, **kwargs):
@@ -287,7 +325,9 @@ class App:
         for box, model in ((self.stt_box, self.stt), (self.tts_box, self.tts)):
             box["btn"].configure(text="Turn OFF" if model else "Turn ON",
                                  state="disabled" if busy else "normal")
-            box["combo"].configure(state="disabled" if (busy or model) else "readonly")
+            locked = busy or model
+            box["combo"].configure(state="disabled" if locked else "readonly")
+            box["device"].configure(state="disabled" if locked else "readonly")
         self.rec_btn.configure(state="disabled" if (busy or not self.stt) else "normal")
         self.speak_btn.configure(state="disabled" if (busy or not self.tts) else "normal")
 
@@ -354,26 +394,39 @@ class App:
         if not path:
             messagebox.showwarning("STT", "No model selected.")
             return
+        device = self.stt_box["device"].get()
+        self._save_settings()
         self.set_status(self.stt_box, "● Loading...", "#b9770e")
-        self.run_bg(self._load_stt, label, path)
+        self.run_bg(self._load_stt, label, path, device)
 
-    def _load_stt(self, label, path):
-        self.log("stt_load_start", message=f"Loading Whisper: {label}", path=path)
+    def _load_stt(self, label, path, device):
+        use_gpu = device.startswith("GPU")
+        dev, ctype = ("cuda", "float16") if use_gpu else ("cpu", "int8")
+        self.log("stt_load_start", message=f"Loading Whisper: {label} on {dev}",
+                 path=path, device=dev, compute_type=ctype)
         if not os.path.isfile(os.path.join(path, "model.bin")):
             self.log("stt_load", "error", "model.bin not found", path=path)
             self.ui(self.set_status, self.stt_box, "● OFF", "#c0392b")
             return
         t = time.perf_counter()
         try:
-            self.stt = WhisperModel(path, device="cpu", compute_type="int8")
+            model = WhisperModel(path, device=dev, compute_type=ctype)
+            if use_gpu:  # warm-up: catches missing CUDA libraries right now
+                segs, _ = model.transcribe(np.zeros(SAMPLE_RATE, dtype="float32"),
+                                           language="fa")
+                list(segs)
+            self.stt = model
         except Exception as e:
             self.stt = None
-            self.log("stt_load", "error", f"Load failed: {e}", path=path)
+            hint = " (check CUDA libraries: nvidia-cublas-cu12, nvidia-cudnn-cu12)" if use_gpu else ""
+            self.log("stt_load", "error", f"Load failed on {dev}: {e}{hint}",
+                     path=path, device=dev)
             self.ui(self.set_status, self.stt_box, "● OFF", "#c0392b")
             return
         dt = round(time.perf_counter() - t, 2)
-        self.log("stt_load", message=f"Whisper is ON ({dt}s)", path=path, seconds=dt)
-        self.ui(self.set_status, self.stt_box, "● ON", "#1e8449")
+        self.log("stt_load", message=f"Whisper is ON on {dev} ({dt}s)",
+                 path=path, device=dev, seconds=dt)
+        self.ui(self.set_status, self.stt_box, f"● ON ({dev})", "#1e8449")
 
     # ---------------- TTS on/off ----------------
     def toggle_tts(self):
@@ -389,27 +442,47 @@ class App:
         if not path:
             messagebox.showwarning("TTS", "No voice selected.")
             return
+        device = self.tts_box["device"].get()
+        self._save_settings()
         self.set_status(self.tts_box, "● Loading...", "#b9770e")
-        self.run_bg(self._load_tts, label, path)
+        self.run_bg(self._load_tts, label, path, device)
 
-    def _load_tts(self, label, path):
-        self.log("tts_load_start", message=f"Loading Piper: {label}", path=path)
+    def _load_tts(self, label, path, device):
+        use_gpu = device.startswith("GPU")
+        dev = "cuda" if use_gpu else "cpu"
+        self.log("tts_load_start", message=f"Loading Piper: {label} on {dev}",
+                 path=path, device=dev)
         config = path + ".json"
         if not os.path.isfile(config):
             self.log("tts_load", "error", "Config .onnx.json not found", config=config)
             self.ui(self.set_status, self.tts_box, "● OFF", "#c0392b")
             return
+        if use_gpu:
+            try:
+                import onnxruntime as ort
+                providers = ort.get_available_providers()
+            except Exception as e:
+                self.log("tts_load", "error", f"onnxruntime import failed: {e}")
+                self.ui(self.set_status, self.tts_box, "● OFF", "#c0392b")
+                return
+            if "CUDAExecutionProvider" not in providers:
+                self.log("tts_load", "error",
+                         "onnxruntime-gpu is not installed (CUDA provider missing)",
+                         providers=providers)
+                self.ui(self.set_status, self.tts_box, "● OFF", "#c0392b")
+                return
         t = time.perf_counter()
         try:
-            self.tts = PiperVoice.load(path, config_path=config)
+            self.tts = PiperVoice.load(path, config_path=config, use_cuda=use_gpu)
         except Exception as e:
             self.tts = None
-            self.log("tts_load", "error", f"Load failed: {e}", path=path)
+            self.log("tts_load", "error", f"Load failed on {dev}: {e}", path=path)
             self.ui(self.set_status, self.tts_box, "● OFF", "#c0392b")
             return
         dt = round(time.perf_counter() - t, 2)
-        self.log("tts_load", message=f"Piper is ON ({dt}s)", path=path, seconds=dt)
-        self.ui(self.set_status, self.tts_box, "● ON", "#1e8449")
+        self.log("tts_load", message=f"Piper is ON on {dev} ({dt}s)",
+                 path=path, device=dev, seconds=dt)
+        self.ui(self.set_status, self.tts_box, f"● ON ({dev})", "#1e8449")
 
     # ---------------- record -> STT -> (TTS) ----------------
     def start_record(self):
